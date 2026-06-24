@@ -9,7 +9,7 @@ type Step = 'email' | 'otp'
 export default function LoginPage() {
   const router = useRouter()
   const [step, setStep] = useState<Step>('email')
-  const [email, setEmail] = useState('phuongnst@gmail.com')
+  const [email, setEmail] = useState('')
   const [otp, setOtp] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
