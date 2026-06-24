@@ -1,10 +1,14 @@
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || ''
+import { getToken } from './auth'
 
-const headers = (): HeadersInit => ({
-  'Content-Type': 'application/json',
-  ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
-})
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+const headers = (): HeadersInit => {
+  const token = getToken()
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
+}
 
 export interface Signal {
   ticker: string
@@ -51,9 +55,13 @@ export interface BacktestResult {
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API}${path}`, {
-    next: { revalidate: 300 },
+    next: { revalidate: 0 },
     headers: headers(),
   })
+  if (res.status === 401) {
+    if (typeof window !== 'undefined') window.location.href = '/login'
+    throw new Error('Phiên đăng nhập hết hạn')
+  }
   if (!res.ok) throw new Error(`API error ${res.status}: ${path}`)
   return res.json()
 }
@@ -64,6 +72,10 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
     headers: headers(),
     body: body ? JSON.stringify(body) : undefined,
   })
+  if (res.status === 401) {
+    if (typeof window !== 'undefined') window.location.href = '/login'
+    throw new Error('Phiên đăng nhập hết hạn')
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || `API error ${res.status}`)

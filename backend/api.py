@@ -12,8 +12,10 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, field_validator
+from jose import JWTError
+from pydantic import BaseModel, EmailStr, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -25,6 +27,7 @@ if root not in sys.path:
     sys.path.insert(0, root)
 
 import config
+import auth as auth_module
 from data.fetcher import DataFetcher
 from indicators import add_all_indicators
 from signals.aggregator import SignalAggregator
@@ -50,14 +53,27 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key"],
 )
 
-# --- API Key auth (tuỳ chọn — bật khi set API_KEY env var) ---
+# --- JWT auth ---
+_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/verify-otp", auto_error=False)
+
+
+def get_current_user(token: Optional[str] = Depends(_oauth2)) -> dict:
+    if not token:
+        raise HTTPException(status_code=401, detail="Chưa đăng nhập")
+    try:
+        return auth_module.decode_token(token)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token không hợp lệ hoặc đã hết hạn")
+
+
+# --- Legacy API Key (vẫn giữ cho backward compat) ---
 _API_KEY = os.getenv("API_KEY", "")
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def verify_api_key(key: Optional[str] = Security(_api_key_header)):
     if not _API_KEY:
-        return  # Không bật auth nếu chưa set API_KEY
+        return
     if key != _API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
@@ -169,12 +185,76 @@ class TelegramConfig(BaseModel):
 
 # --- Endpoints ---
 
+# --- Auth models ---
+class OTPRequest(BaseModel):
+    email: EmailStr
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    otp: str
+
+    @field_validator('otp')
+    @classmethod
+    def otp_digits(cls, v: str) -> str:
+        if not re.match(r'^\d{6}$', v):
+            raise ValueError('OTP phải là 6 chữ số')
+        return v
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str
+    name: str
+    email: str
+
+class UserOut(BaseModel):
+    name: str
+    email: str
+
+
+# --- Auth endpoints ---
+@app.post("/auth/request-otp")
+@limiter.limit("5/minute")
+def request_otp(request: Request, body: OTPRequest):
+    """Send OTP to registered email."""
+    try:
+        ok = auth_module.request_otp(body.email)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Không thể gửi email: {e}")
+    if not ok:
+        # Trả 200 để tránh email enumeration
+        return {"detail": "Nếu email hợp lệ, mã OTP đã được gửi."}
+    return {"detail": "Mã OTP đã được gửi. Kiểm tra hộp thư của bạn."}
+
+
+@app.post("/auth/verify-otp", response_model=TokenOut)
+@limiter.limit("10/minute")
+def verify_otp(request: Request, body: OTPVerify):
+    """Verify OTP and return JWT token."""
+    try:
+        token = auth_module.verify_otp(body.email, body.otp)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TokenOut(
+        access_token=token,
+        token_type="bearer",
+        name=auth_module.ADMIN_NAME,
+        email=body.email,
+    )
+
+
+@app.get("/auth/me", response_model=UserOut)
+def me(user: dict = Depends(get_current_user)):
+    """Return current logged-in user info."""
+    return UserOut(name=user.get("name", ""), email=user.get("sub", ""))
+
+
+# --- Health (public) ---
 @app.get("/api/health")
 def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
-@app.get("/api/signals", response_model=ScanResult, dependencies=[Depends(verify_api_key)])
+@app.get("/api/signals", response_model=ScanResult, dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 def get_signals(request: Request, demo: bool = True, top_buy: int = 10, top_sell: int = 5):
     top_buy = min(max(top_buy, 1), 20)
@@ -221,7 +301,7 @@ def get_signals(request: Request, demo: bool = True, top_buy: int = 10, top_sell
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/stocks", response_model=List[str], dependencies=[Depends(verify_api_key)])
+@app.get("/api/stocks", response_model=List[str], dependencies=[Depends(get_current_user)])
 @limiter.limit("20/minute")
 def get_stocks(request: Request, demo: bool = True):
     """Return list of available stock tickers."""
@@ -229,7 +309,7 @@ def get_stocks(request: Request, demo: bool = True):
     return fetcher.get_stock_list()
 
 
-@app.get("/api/stocks/{ticker}", response_model=List[StockBar], dependencies=[Depends(verify_api_key)])
+@app.get("/api/stocks/{ticker}", response_model=List[StockBar], dependencies=[Depends(get_current_user)])
 @limiter.limit("30/minute")
 def get_stock_data(request: Request, ticker: str, days: int = 180, demo: bool = True):
     ticker = validate_ticker(ticker)
@@ -264,7 +344,7 @@ def get_stock_data(request: Request, ticker: str, days: int = 180, demo: bool = 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/backtest", response_model=BacktestOut, dependencies=[Depends(verify_api_key)])
+@app.get("/api/backtest", response_model=BacktestOut, dependencies=[Depends(get_current_user)])
 @limiter.limit("3/minute")
 def run_backtest(request: Request, demo: bool = True):
     """Run strategy backtest on historical data."""
@@ -290,7 +370,7 @@ def run_backtest(request: Request, demo: bool = True):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/telegram/test", dependencies=[Depends(verify_api_key)])
+@app.post("/api/telegram/test", dependencies=[Depends(get_current_user)])
 @limiter.limit("5/minute")
 def test_telegram(request: Request, cfg: TelegramConfig):
     """Send a test message to verify Telegram config."""
@@ -302,7 +382,7 @@ def test_telegram(request: Request, cfg: TelegramConfig):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/notify", dependencies=[Depends(verify_api_key)])
+@app.post("/api/notify", dependencies=[Depends(get_current_user)])
 @limiter.limit("5/minute")
 def send_notification(request: Request, demo: bool = True):
     """Trigger immediate signal scan + Telegram notification."""
