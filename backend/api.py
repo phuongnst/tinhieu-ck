@@ -44,13 +44,15 @@ app = FastAPI(title="VN Stock Signal API", version="1.0.0", docs_url=None, redoc
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- CORS: chỉ cho phép Vercel domain của bạn ---
+# --- CORS ---
 _ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+_wildcard = "*" in _ALLOWED_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_origins=["*"] if _wildcard else _ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
+    allow_credentials=not _wildcard,  # credentials không dùng được khi origin=*
 )
 
 # --- JWT auth ---
