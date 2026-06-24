@@ -1,4 +1,10 @@
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || ''
+
+const headers = (): HeadersInit => ({
+  'Content-Type': 'application/json',
+  ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+})
 
 export interface Signal {
   ticker: string
@@ -44,8 +50,24 @@ export interface BacktestResult {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, { next: { revalidate: 300 } })
+  const res = await fetch(`${API}${path}`, {
+    next: { revalidate: 300 },
+    headers: headers(),
+  })
   if (!res.ok) throw new Error(`API error ${res.status}: ${path}`)
+  return res.json()
+}
+
+async function post<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: headers(),
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `API error ${res.status}`)
+  }
   return res.json()
 }
 
@@ -56,11 +78,7 @@ export const api = {
     get<StockBar[]>(`/api/stocks/${ticker}?days=${days}&demo=${demo}`),
   backtest: (demo = true) => get<BacktestResult>(`/api/backtest?demo=${demo}`),
   testTelegram: (token: string, chatId: string) =>
-    fetch(`${API}/api/telegram/test`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, chat_id: chatId }),
-    }).then(r => r.json()),
+    post<{ success: boolean; detail?: string }>('/api/telegram/test', { token, chat_id: chatId }),
   notify: (demo = true) =>
-    fetch(`${API}/api/notify?demo=${demo}`, { method: 'POST' }).then(r => r.json()),
+    post<{ success: boolean }>(`/api/notify?demo=${demo}`),
 }
