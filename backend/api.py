@@ -5,13 +5,19 @@ Deploy on Railway: railway up
 
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request
 
 # Add project root to path (works both locally and on Railway)
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,14 +35,42 @@ from notifications.telegram_bot import TelegramNotifier
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="VN Stock Signal API", version="1.0.0")
+# --- Rate limiter ---
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="VN Stock Signal API", version="1.0.0", docs_url=None, redoc_url=None)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# --- CORS: chỉ cho phép Vercel domain của bạn ---
+_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# --- API Key auth (tuỳ chọn — bật khi set API_KEY env var) ---
+_API_KEY = os.getenv("API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(key: Optional[str] = Security(_api_key_header)):
+    if not _API_KEY:
+        return  # Không bật auth nếu chưa set API_KEY
+    if key != _API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+
+# --- Ticker validation ---
+_TICKER_RE = re.compile(r'^[A-Z0-9]{2,10}$')
+
+
+def validate_ticker(ticker: str) -> str:
+    t = ticker.upper().strip()
+    if not _TICKER_RE.match(t):
+        raise HTTPException(status_code=400, detail="Mã cổ phiếu không hợp lệ")
+    return t
 
 # --- Global state (cached) ---
 _cache: dict = {}
@@ -118,6 +152,20 @@ class TelegramConfig(BaseModel):
     token: str
     chat_id: str
 
+    @field_validator('token')
+    @classmethod
+    def token_format(cls, v: str) -> str:
+        if not re.match(r'^\d+:[A-Za-z0-9_-]{35,}$', v):
+            raise ValueError('Token Telegram không đúng định dạng')
+        return v
+
+    @field_validator('chat_id')
+    @classmethod
+    def chat_id_format(cls, v: str) -> str:
+        if not re.match(r'^-?\d+$', v):
+            raise ValueError('Chat ID phải là số nguyên')
+        return v
+
 
 # --- Endpoints ---
 
@@ -126,8 +174,11 @@ def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
-@app.get("/api/signals", response_model=ScanResult)
-def get_signals(demo: bool = True, top_buy: int = 10, top_sell: int = 5):
+@app.get("/api/signals", response_model=ScanResult, dependencies=[Depends(verify_api_key)])
+@limiter.limit("10/minute")
+def get_signals(request: Request, demo: bool = True, top_buy: int = 10, top_sell: int = 5):
+    top_buy = min(max(top_buy, 1), 20)
+    top_sell = min(max(top_sell, 1), 10)
     """Run full signal scan and return ranked buy/sell list."""
     global _last_scan
     try:
@@ -170,15 +221,19 @@ def get_signals(demo: bool = True, top_buy: int = 10, top_sell: int = 5):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/stocks", response_model=List[str])
-def get_stocks(demo: bool = True):
+@app.get("/api/stocks", response_model=List[str], dependencies=[Depends(verify_api_key)])
+@limiter.limit("20/minute")
+def get_stocks(request: Request, demo: bool = True):
     """Return list of available stock tickers."""
     fetcher = DataFetcher(demo=demo)
     return fetcher.get_stock_list()
 
 
-@app.get("/api/stocks/{ticker}", response_model=List[StockBar])
-def get_stock_data(ticker: str, days: int = 180, demo: bool = True):
+@app.get("/api/stocks/{ticker}", response_model=List[StockBar], dependencies=[Depends(verify_api_key)])
+@limiter.limit("30/minute")
+def get_stock_data(request: Request, ticker: str, days: int = 180, demo: bool = True):
+    ticker = validate_ticker(ticker)
+    days = min(max(days, 10), 365)
     """Return OHLCV + indicators for a single ticker."""
     try:
         fetcher = DataFetcher(demo=demo)
@@ -209,8 +264,9 @@ def get_stock_data(ticker: str, days: int = 180, demo: bool = True):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/backtest", response_model=BacktestOut)
-def run_backtest(demo: bool = True):
+@app.get("/api/backtest", response_model=BacktestOut, dependencies=[Depends(verify_api_key)])
+@limiter.limit("3/minute")
+def run_backtest(request: Request, demo: bool = True):
     """Run strategy backtest on historical data."""
     try:
         ticker_dfs = get_ticker_dfs(demo=demo)
@@ -234,8 +290,9 @@ def run_backtest(demo: bool = True):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/telegram/test")
-def test_telegram(cfg: TelegramConfig):
+@app.post("/api/telegram/test", dependencies=[Depends(verify_api_key)])
+@limiter.limit("5/minute")
+def test_telegram(request: Request, cfg: TelegramConfig):
     """Send a test message to verify Telegram config."""
     try:
         notifier = TelegramNotifier(cfg.token, cfg.chat_id)
@@ -245,8 +302,9 @@ def test_telegram(cfg: TelegramConfig):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/notify")
-def send_notification(demo: bool = True):
+@app.post("/api/notify", dependencies=[Depends(verify_api_key)])
+@limiter.limit("5/minute")
+def send_notification(request: Request, demo: bool = True):
     """Trigger immediate signal scan + Telegram notification."""
     if not config.TELEGRAM_TOKEN:
         raise HTTPException(status_code=400, detail="TELEGRAM_TOKEN not configured")
