@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.security.api_key import APIKeyHeader
 from jose import JWTError
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -56,7 +56,7 @@ app.add_middleware(
 )
 
 # --- JWT auth ---
-_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/verify-otp", auto_error=False)
+_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
 def get_current_user(token: Optional[str] = Depends(_oauth2)) -> dict:
@@ -188,66 +188,35 @@ class TelegramConfig(BaseModel):
 # --- Endpoints ---
 
 # --- Auth models ---
-class OTPRequest(BaseModel):
-    email: EmailStr
-
-class OTPVerify(BaseModel):
-    email: EmailStr
-    otp: str
-
-    @field_validator('otp')
-    @classmethod
-    def otp_digits(cls, v: str) -> str:
-        if not re.match(r'^\d{6}$', v):
-            raise ValueError('OTP phải là 6 chữ số')
-        return v
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 class TokenOut(BaseModel):
     access_token: str
     token_type: str
     name: str
-    email: str
 
 class UserOut(BaseModel):
     name: str
-    email: str
+    username: str
 
 
 # --- Auth endpoints ---
-@app.post("/auth/request-otp")
+@app.post("/auth/login", response_model=TokenOut)
 @limiter.limit("5/minute")
-def request_otp(request: Request, body: OTPRequest):
-    """Send OTP to registered email."""
-    try:
-        ok = auth_module.request_otp(body.email)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Không thể gửi email: {e}")
-    if not ok:
-        # Trả 200 để tránh email enumeration
-        return {"detail": "Nếu email hợp lệ, mã OTP đã được gửi."}
-    return {"detail": "Mã OTP đã được gửi. Kiểm tra hộp thư của bạn."}
-
-
-@app.post("/auth/verify-otp", response_model=TokenOut)
-@limiter.limit("10/minute")
-def verify_otp(request: Request, body: OTPVerify):
-    """Verify OTP and return JWT token."""
-    try:
-        token = auth_module.verify_otp(body.email, body.otp)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return TokenOut(
-        access_token=token,
-        token_type="bearer",
-        name=auth_module.ADMIN_NAME,
-        email=body.email,
-    )
+def login(request: Request, body: LoginRequest):
+    """Login with username and password, return JWT token."""
+    token = auth_module.login(body.username, body.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng")
+    return TokenOut(access_token=token, token_type="bearer", name=auth_module.ADMIN_USERNAME)
 
 
 @app.get("/auth/me", response_model=UserOut)
 def me(user: dict = Depends(get_current_user)):
     """Return current logged-in user info."""
-    return UserOut(name=user.get("name", ""), email=user.get("sub", ""))
+    return UserOut(name=user.get("name", ""), username=user.get("sub", ""))
 
 
 # --- Health (public) ---

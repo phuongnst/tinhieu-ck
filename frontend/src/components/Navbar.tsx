@@ -56,7 +56,7 @@ export default function Navbar() {
               <div className="w-7 h-7 rounded-full bg-green-500/20 flex items-center justify-center">
                 <User size={14} className="text-green-400" />
               </div>
-              <span className="hidden sm:block">{user.name}</span>
+              <span className="hidden sm:block">{user.name || user.username}</span>
             </div>
             <button
               onClick={logout}

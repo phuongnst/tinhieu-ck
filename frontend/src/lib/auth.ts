@@ -4,7 +4,7 @@ const USER_KEY = 'tinhieu_user'
 
 export interface User {
   name: string
-  email: string
+  username: string
 }
 
 export function saveSession(token: string, user: User) {
@@ -38,26 +38,15 @@ export function isLoggedIn(): boolean {
   return !!getToken()
 }
 
-export async function requestOTP(email: string): Promise<string> {
-  const res = await fetch(`${API}/auth/request-otp`, {
+export async function loginWithPassword(username: string, password: string): Promise<User> {
+  const res = await fetch(`${API}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ username, password }),
   })
   const data = await res.json()
-  if (!res.ok) throw new Error(data.detail || 'Lỗi gửi OTP')
-  return data.detail
-}
-
-export async function verifyOTP(email: string, otp: string): Promise<User> {
-  const res = await fetch(`${API}/auth/verify-otp`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, otp }),
-  })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data.detail || 'OTP không hợp lệ')
-  const user: User = { name: data.name, email: data.email }
+  if (!res.ok) throw new Error(data.detail || 'Đăng nhập thất bại')
+  const user: User = { name: data.name, username }
   saveSession(data.access_token, user)
   return user
 }
