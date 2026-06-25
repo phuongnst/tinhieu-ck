@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Security, Depends
@@ -20,6 +20,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from starlette.requests import Request
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import pytz
 
 # Add project root to path (works both locally and on Railway)
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +97,78 @@ def validate_ticker(ticker: str) -> str:
 _cache: dict = {}
 _ml_gen: Optional[MLSignalGenerator] = None
 _last_scan: Optional[datetime] = None
+
+# --- Scheduler config (in-memory, persisted across restarts via env fallback) ---
+_scheduler_config: dict = {
+    "enabled": False,
+    "interval_minutes": int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "30")),
+    "market_only": True,          # only run during trading hours
+    "market_open": os.getenv("MARKET_OPEN", "09:15"),
+    "market_close": os.getenv("MARKET_CLOSE", "15:00"),
+    "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "min_signals": 1,             # min buy+sell signals to trigger notification
+}
+_scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
+_scheduler.start()
+
+
+def _is_market_hours() -> bool:
+    tz = pytz.timezone("Asia/Ho_Chi_Minh")
+    now = datetime.now(tz).time()
+    try:
+        h_open, m_open = map(int, _scheduler_config["market_open"].split(":"))
+        h_close, m_close = map(int, _scheduler_config["market_close"].split(":"))
+        return dtime(h_open, m_open) <= now <= dtime(h_close, m_close)
+    except Exception:
+        return True
+
+
+def _auto_scan_and_notify():
+    """Background job: scan signals and send Telegram if signals found."""
+    cfg = _scheduler_config
+    if cfg["market_only"] and not _is_market_hours():
+        logger.info("Scheduler: skipping scan outside market hours")
+        return
+    if not cfg["telegram_token"] or not cfg["telegram_chat_id"]:
+        logger.warning("Scheduler: Telegram not configured, skipping")
+        return
+    try:
+        ticker_dfs = get_ticker_dfs(demo=False)
+        ml_gen = get_ml_gen()
+        if not ml_gen.model.is_trained:
+            ml_gen.train_on_all(ticker_dfs)
+            ml_gen.save()
+        aggregator = SignalAggregator(
+            rule_weight=config.RULE_WEIGHT,
+            ml_weight=config.ML_WEIGHT,
+            buy_threshold=config.BUY_THRESHOLD,
+            sell_threshold=config.SELL_THRESHOLD,
+            ml_generator=ml_gen,
+        )
+        result = aggregator.rank_signals(ticker_dfs)
+        total_signals = len(result["buy"]) + len(result["sell"])
+        if total_signals >= cfg["min_signals"]:
+            notifier = TelegramNotifier(cfg["telegram_token"], cfg["telegram_chat_id"])
+            notifier.send_signals(result)
+            logger.info(f"Scheduler: sent Telegram — {len(result['buy'])} BUY, {len(result['sell'])} SELL")
+        else:
+            logger.info("Scheduler: no signals to send")
+    except Exception as e:
+        logger.error(f"Scheduler error: {e}")
+
+
+def _apply_scheduler():
+    """Apply current scheduler config: add/remove the job."""
+    _scheduler.remove_all_jobs()
+    if _scheduler_config["enabled"]:
+        _scheduler.add_job(
+            _auto_scan_and_notify,
+            trigger=IntervalTrigger(minutes=_scheduler_config["interval_minutes"]),
+            id="auto_scan",
+            replace_existing=True,
+        )
+        logger.info(f"Scheduler started: every {_scheduler_config['interval_minutes']} min")
 
 
 def get_ml_gen() -> MLSignalGenerator:
@@ -217,6 +292,93 @@ def login(request: Request, body: LoginRequest):
 def me(user: dict = Depends(get_current_user)):
     """Return current logged-in user info."""
     return UserOut(name=user.get("name", ""), username=user.get("sub", ""))
+
+
+# --- Scheduler models ---
+class SchedulerConfig(BaseModel):
+    enabled: bool
+    interval_minutes: int
+    market_only: bool
+    market_open: str   # "HH:MM"
+    market_close: str  # "HH:MM"
+    telegram_token: str
+    telegram_chat_id: str
+    min_signals: int = 1
+
+    @field_validator("interval_minutes")
+    @classmethod
+    def valid_interval(cls, v: int) -> int:
+        if v < 5 or v > 1440:
+            raise ValueError("Khoảng cách phải từ 5 đến 1440 phút")
+        return v
+
+    @field_validator("market_open", "market_close")
+    @classmethod
+    def valid_time(cls, v: str) -> str:
+        if not re.match(r'^\d{2}:\d{2}$', v):
+            raise ValueError("Thời gian phải có định dạng HH:MM")
+        return v
+
+
+class SchedulerStatus(BaseModel):
+    enabled: bool
+    interval_minutes: int
+    market_only: bool
+    market_open: str
+    market_close: str
+    min_signals: int
+    next_run: Optional[str]
+    last_scan: Optional[str]
+    telegram_configured: bool
+
+
+# --- Scheduler endpoints ---
+@app.get("/api/scheduler", response_model=SchedulerStatus, dependencies=[Depends(get_current_user)])
+def get_scheduler():
+    """Get current scheduler configuration and status."""
+    job = _scheduler.get_job("auto_scan")
+    next_run = job.next_run_time.strftime("%d/%m/%Y %H:%M:%S") if job and job.next_run_time else None
+    cfg = _scheduler_config
+    return SchedulerStatus(
+        enabled=cfg["enabled"],
+        interval_minutes=cfg["interval_minutes"],
+        market_only=cfg["market_only"],
+        market_open=cfg["market_open"],
+        market_close=cfg["market_close"],
+        min_signals=cfg["min_signals"],
+        next_run=next_run,
+        last_scan=_last_scan.strftime("%d/%m/%Y %H:%M:%S") if _last_scan else None,
+        telegram_configured=bool(cfg["telegram_token"] and cfg["telegram_chat_id"]),
+    )
+
+
+@app.post("/api/scheduler", response_model=SchedulerStatus, dependencies=[Depends(get_current_user)])
+@limiter.limit("20/minute")
+def update_scheduler(request: Request, body: SchedulerConfig):
+    """Update scheduler configuration."""
+    global _scheduler_config
+    _scheduler_config.update({
+        "enabled": body.enabled,
+        "interval_minutes": body.interval_minutes,
+        "market_only": body.market_only,
+        "market_open": body.market_open,
+        "market_close": body.market_close,
+        "telegram_token": body.telegram_token,
+        "telegram_chat_id": body.telegram_chat_id,
+        "min_signals": body.min_signals,
+    })
+    _apply_scheduler()
+    return get_scheduler()
+
+
+@app.post("/api/scheduler/run-now", dependencies=[Depends(get_current_user)])
+@limiter.limit("5/minute")
+def run_now(request: Request):
+    """Trigger an immediate scan and Telegram notification."""
+    import threading
+    t = threading.Thread(target=_auto_scan_and_notify)
+    t.start()
+    return {"detail": "Đang quét tín hiệu và gửi Telegram..."}
 
 
 # --- Health (public) ---

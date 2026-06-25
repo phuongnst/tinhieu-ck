@@ -83,6 +83,29 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   return res.json()
 }
 
+export interface SchedulerStatus {
+  enabled: boolean
+  interval_minutes: number
+  market_only: boolean
+  market_open: string
+  market_close: string
+  min_signals: number
+  next_run: string | null
+  last_scan: string | null
+  telegram_configured: boolean
+}
+
+export interface SchedulerConfig {
+  enabled: boolean
+  interval_minutes: number
+  market_only: boolean
+  market_open: string
+  market_close: string
+  min_signals: number
+  telegram_token: string
+  telegram_chat_id: string
+}
+
 export const api = {
   signals: (demo = true) => get<ScanResult>(`/api/signals?demo=${demo}&top_buy=10&top_sell=5`),
   stocks: (demo = true) => get<string[]>(`/api/stocks?demo=${demo}`),
@@ -93,4 +116,7 @@ export const api = {
     post<{ success: boolean; detail?: string }>('/api/telegram/test', { token, chat_id: chatId }),
   notify: (demo = true) =>
     post<{ success: boolean }>(`/api/notify?demo=${demo}`),
+  getScheduler: () => get<SchedulerStatus>('/api/scheduler'),
+  updateScheduler: (cfg: SchedulerConfig) => post<SchedulerStatus>('/api/scheduler', cfg),
+  runNow: () => post<{ detail: string }>('/api/scheduler/run-now'),
 }
