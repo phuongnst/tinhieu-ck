@@ -7,10 +7,14 @@ export interface User {
   username: string
 }
 
+const COOKIE_MAX_AGE = 60 * 60 * 24 // 24h
+
 export function saveSession(token: string, user: User) {
   if (typeof window === 'undefined') return
   localStorage.setItem(TOKEN_KEY, token)
   localStorage.setItem(USER_KEY, JSON.stringify(user))
+  // Also save to cookie so middleware can read it server-side
+  document.cookie = `${TOKEN_KEY}=${token}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`
 }
 
 export function getToken(): string | null {
@@ -32,6 +36,7 @@ export function clearSession() {
   if (typeof window === 'undefined') return
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(USER_KEY)
+  document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`
 }
 
 export function isLoggedIn(): boolean {
